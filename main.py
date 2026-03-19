@@ -177,15 +177,15 @@ class CommandWorker(QThread):
                 return
 
             self.status_signal.emit("Launching app...")
-            self.log_signal.emit(">> Launching Flutter app in background...")
-            launched = self._launch_flutter_run_detached()
-            if not launched:
+            self.log_signal.emit(">> Launching Flutter app...")
+            ok = self._launch_flutter_run()
+            if self._cancelled:
+                self.finished_signal.emit(False, "Cancelled")
+                return
+            if not ok:
                 self.finished_signal.emit(False, "Flutter launch failed.")
                 return
-
-            self.launch_ready_signal.emit()
-            self.progress_signal.emit(100)
-            self.finished_signal.emit(True, "App started 🚀")
+            self.finished_signal.emit(True, "App closed")
 
         except Exception as exc:
             self.finished_signal.emit(False, f"Unexpected error: {exc}")
@@ -261,7 +261,7 @@ class CommandWorker(QThread):
             self.log_signal.emit(f"⚠ Command error: {exc}")
             return tolerate_failure
 
-    def _launch_flutter_run_detached(self):
+    def _launch_flutter_run(self):
         if not self._flutter_cmd:
             self.log_signal.emit("⚠ Flutter executable is not available.")
             return False
@@ -273,29 +273,36 @@ class CommandWorker(QThread):
         else:
             command = [self._flutter_cmd, "run", "-d", "chrome"]
 
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+
         try:
-            if os.name == "nt":
-                creationflags = (
-                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-                )
-                self._launched_process = subprocess.Popen(
-                    command,
-                    cwd=self.project_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=creationflags,
-                )
-            else:
-                self._launched_process = subprocess.Popen(
-                    command,
-                    cwd=self.project_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            return True
+            self._launched_process = subprocess.Popen(
+                command,
+                cwd=self.project_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                creationflags=creationflags,
+            )
+
+            self.launch_ready_signal.emit()
+            self.progress_signal.emit(100)
+
+            assert self._launched_process.stdout is not None
+            for line in self._launched_process.stdout:
+                if self._cancelled:
+                    self._kill_launched_process_tree()
+                    return False
+                self.log_signal.emit(line.rstrip())
+
+            code = self._launched_process.wait()
+            self._launched_process = None
+            return code == 0
         except Exception as exc:
             self.log_signal.emit(f"⚠ Launch error: {exc}")
             return False
@@ -937,8 +944,8 @@ class LauncherWindow(QMainWindow):
                 self.set_status("Build complete ✅")
                 self.log(f"✅ Build output: {message}")
             else:
-                self.set_status("App started 🚀")
-                self.log("✅ Flutter app started.")
+                self.set_status("App closed ✅")
+                self.log("✅ Flutter app exited.")
             self.set_progress(100)
         else:
             if message == "Cancelled":
