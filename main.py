@@ -3,19 +3,33 @@ import sys
 import signal
 import shutil
 import subprocess
+import ctypes
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QPoint, QSettings
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
+import requests
+
+try:
+    import qtawesome as qta
+except ImportError:
+    qta = None
+
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QPoint, QSettings, QEvent
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QInputDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLineEdit,
     QLabel,
     QFileDialog,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -23,7 +37,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSplitter,
+    QSizeGrip,
     QSizePolicy,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -34,7 +51,148 @@ APP_TITLE = "Flutter Dev Launcher"
 WINDOW_W = 1180
 WINDOW_H = 760
 LEFT_PANEL_W = 360
-APP_ICON_PATH = Path(__file__).parent / "assets" / "logo.png"
+
+
+def resource_path(*parts: str) -> Path:
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base_path.joinpath(*parts)
+
+
+APP_ICON_PATH = resource_path("assets", "logo.png")
+
+
+def set_windows_app_id(app_id: str):
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
+def extract_description_text(description):
+    if description is None:
+        return "No description."
+
+    if isinstance(description, str):
+        return description.strip() or "No description."
+
+    if not isinstance(description, dict):
+        return str(description)
+
+    parts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                parts.append(node.get("text", ""))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(description)
+    text = "".join(parts).strip()
+    return text if text else "No description."
+
+
+def extract_ticket_comments(fields):
+    comments = fields.get("comment", {}).get("comments", [])
+    if not comments:
+        return "No comments."
+
+    blocks = []
+    for comment in comments:
+        author = comment.get("author", {}).get("displayName", "Unknown")
+        body = extract_description_text(comment.get("body"))
+        blocks.append(f"- {author}:\n{body}")
+    return "\n\n".join(blocks)
+
+
+def parse_project_keys(raw_keys: str):
+    return [key.strip() for key in raw_keys.split(",") if key.strip()]
+
+
+def extract_media_attachments(fields):
+    attachments = fields.get("attachment", [])
+    media = []
+    for attachment in attachments:
+        filename = attachment.get("filename", "unnamed")
+        mime_type = (attachment.get("mimeType") or "").lower()
+        lower_name = filename.lower()
+        is_image = mime_type.startswith("image/") or lower_name.endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg")
+        )
+        is_video = mime_type.startswith("video/") or lower_name.endswith(
+            (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
+        )
+
+        if is_image or is_video:
+            media.append(
+                {
+                    "filename": filename,
+                    "mime": mime_type,
+                    "kind": "image" if is_image else "video",
+                    "url": attachment.get("content") or "",
+                    "thumbnail": attachment.get("thumbnail") or "",
+                }
+            )
+    return media
+
+
+class JiraClient:
+    def __init__(self, base_url: str, email: str, api_token: str):
+        self.base_url = base_url.rstrip("/")
+        self.auth = (email, api_token)
+        self.headers = {"Accept": "application/json"}
+
+    def get_testing_tickets(self, board_digits: str):
+        url = f"{self.base_url}/rest/api/3/search/jql"
+        project_keys = parse_project_keys(board_digits)
+        if not project_keys:
+            raise ValueError("At least one Jira project key is required.")
+
+        if len(project_keys) == 1:
+            project_filter = f'project = "{project_keys[0]}"'
+        else:
+            joined = ", ".join([f'"{key}"' for key in project_keys])
+            project_filter = f"project in ({joined})"
+
+        jql = f'{project_filter} AND status = "Testing" ORDER BY updated DESC'
+        params = {
+            "jql": jql,
+            "maxResults": 50,
+            "fields": [
+                "summary",
+                "description",
+                "status",
+                "assignee",
+                "priority",
+                "comment",
+                "attachment",
+            ],
+        }
+
+        response = requests.get(
+            url,
+            auth=self.auth,
+            headers=self.headers,
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json().get("issues", [])
+
+    def fetch_binary(self, url: str):
+        response = requests.get(
+            url,
+            auth=self.auth,
+            headers={"Accept": "*/*"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.content
 
 
 class Palette:
@@ -50,6 +208,58 @@ class Palette:
     GREEN = "#24d08a"
     YELLOW = "#f7c948"
     RED = "#ff5d73"
+
+
+class JiraSettingsDialog(QDialog):
+    def __init__(
+        self,
+        jira_url: str,
+        jira_email: str,
+        jira_api_token: str,
+        jira_board_digits: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Jira Settings")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel("Jira URL"))
+        self.jira_url_input = QLineEdit(jira_url)
+        self.jira_url_input.setPlaceholderText("https://company.atlassian.net")
+        layout.addWidget(self.jira_url_input)
+
+        layout.addWidget(QLabel("Jira Email"))
+        self.jira_email_input = QLineEdit(jira_email)
+        self.jira_email_input.setPlaceholderText("you@company.com")
+        layout.addWidget(self.jira_email_input)
+
+        layout.addWidget(QLabel("Jira API Token"))
+        self.jira_api_token_input = QLineEdit(jira_api_token)
+        self.jira_api_token_input.setEchoMode(QLineEdit.Password)
+        self.jira_api_token_input.setPlaceholderText("API token")
+        layout.addWidget(self.jira_api_token_input)
+
+        layout.addWidget(QLabel("Project Keys (comma-separated)"))
+        self.jira_board_digits_input = QLineEdit(jira_board_digits)
+        self.jira_board_digits_input.setPlaceholderText("IKD, CORE, MOBILE")
+        layout.addWidget(self.jira_board_digits_input)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self):
+        return (
+            self.jira_url_input.text().strip(),
+            self.jira_email_input.text().strip(),
+            self.jira_api_token_input.text().strip(),
+            self.jira_board_digits_input.text().strip(),
+        )
 
 
 class CommandWorker(QThread):
@@ -363,7 +573,7 @@ class TitleBar(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_window = parent
-        self.drag_pos = QPoint()
+        self.drag_pos = None
         self.setObjectName("TitleBar")
         self.setFixedHeight(58)
 
@@ -390,18 +600,39 @@ class TitleBar(QFrame):
         layout.addLayout(heading_wrap)
         layout.addStretch()
 
+        self.settings_btn = QPushButton("")
         self.min_btn = QPushButton("—")
+        self.max_btn = QPushButton("□")
         self.close_btn = QPushButton("✕")
+        self.settings_btn.setObjectName("TitleButton")
         self.min_btn.setObjectName("TitleButton")
+        self.max_btn.setObjectName("TitleButton")
         self.close_btn.setObjectName("TitleButtonClose")
+        self.settings_btn.setFixedSize(38, 34)
         self.min_btn.setFixedSize(38, 34)
+        self.max_btn.setFixedSize(38, 34)
         self.close_btn.setFixedSize(38, 34)
 
+        if qta is not None:
+            self.settings_btn.setIcon(qta.icon("fa5s.cog", color=Palette.TEXT))
+            self.settings_btn.setIconSize(QSize(15, 15))
+        else:
+            self.settings_btn.setText("⚙")
+        self.settings_btn.setToolTip("Jira Settings")
+
+        self.settings_btn.clicked.connect(self._open_settings)
         self.min_btn.clicked.connect(self._minimize)
+        self.max_btn.clicked.connect(self._toggle_maximize)
         self.close_btn.clicked.connect(self._close)
 
+        layout.addWidget(self.settings_btn)
         layout.addWidget(self.min_btn)
+        layout.addWidget(self.max_btn)
         layout.addWidget(self.close_btn)
+
+    def _open_settings(self):
+        if self.parent_window:
+            self.parent_window.open_jira_settings_dialog()
 
     def _minimize(self):
         if self.parent_window:
@@ -411,8 +642,25 @@ class TitleBar(QFrame):
         if self.parent_window:
             self.parent_window.close()
 
+    def _toggle_maximize(self):
+        if not self.parent_window:
+            return
+
+        if self.parent_window.isMaximized():
+            self.parent_window.showNormal()
+            self.max_btn.setText("□")
+        else:
+            self.parent_window.showMaximized()
+            self.max_btn.setText("❐")
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.LeftButton and self.parent_window:
+            handle = self.parent_window.windowHandle()
+            if handle and handle.startSystemMove():
+                self.drag_pos = None
+                event.accept()
+                return
+
             self.drag_pos = (
                 event.globalPosition().toPoint()
                 - self.parent_window.frameGeometry().topLeft()
@@ -420,7 +668,7 @@ class TitleBar(QFrame):
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
+        if event.buttons() & Qt.LeftButton and self.drag_pos is not None:
             self.parent_window.move(event.globalPosition().toPoint() - self.drag_pos)
             event.accept()
 
@@ -431,6 +679,15 @@ class LauncherWindow(QMainWindow):
         self.worker = None
         self.dragging = False
         self.settings = QSettings("FlutterDevLauncher", "Launcher")
+        self.jira_url = self.settings.value(
+            "jira_url", "https://saphi.atlassian.net", str
+        )
+        self.jira_email = self.settings.value("jira_email", "", str)
+        self.jira_api_token = self.settings.value("jira_api_token", "", str)
+        self.jira_board_digits = self.settings.value("jira_board_digits", "IKD", str)
+        self.testing_tickets = []
+        self.current_ticket_media = []
+        self.selected_ticket_key = ""
         self.project_dir = self._load_saved_project_dir()
         self.build_output_path = None
 
@@ -439,16 +696,21 @@ class LauncherWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(QSize(WINDOW_W, WINDOW_H))
         self.resize(WINDOW_W, WINDOW_H)
-        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.FramelessWindowHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+        )
         self.setAttribute(Qt.WA_TranslucentBackground)
 
         outer = QWidget()
-        outer_layout = QVBoxLayout(outer)
-        outer_layout.setContentsMargins(18, 18, 18, 18)
+        self.outer_layout = QVBoxLayout(outer)
+        self.outer_layout.setContentsMargins(18, 18, 18, 18)
 
-        shell = QFrame()
-        shell.setObjectName("Shell")
-        shell_layout = QVBoxLayout(shell)
+        self.shell = QFrame()
+        self.shell.setObjectName("Shell")
+        shell_layout = QVBoxLayout(self.shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
 
@@ -461,7 +723,7 @@ class LauncherWindow(QMainWindow):
         body_layout.setSpacing(18)
 
         shell_layout.addWidget(body)
-        outer_layout.addWidget(shell)
+        self.outer_layout.addWidget(self.shell)
         self.setCentralWidget(outer)
 
         left_panel = self._build_left_panel()
@@ -470,7 +732,34 @@ class LauncherWindow(QMainWindow):
         body_layout.addWidget(left_panel, 0)
         body_layout.addWidget(right_panel, 1)
 
+        resize_row = QHBoxLayout()
+        resize_row.setContentsMargins(0, 0, 10, 10)
+        resize_row.setSpacing(0)
+        resize_row.addStretch()
+        self.size_grip = QSizeGrip(self.shell)
+        self.size_grip.setToolTip("Drag to resize")
+        resize_row.addWidget(self.size_grip, 0, Qt.AlignRight | Qt.AlignBottom)
+        shell_layout.addLayout(resize_row)
+
         self._apply_styles()
+        self._update_window_chrome()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._update_window_chrome()
+
+    def _update_window_chrome(self):
+        maximized = self.isMaximized()
+        margin = 0 if maximized else 18
+        self.outer_layout.setContentsMargins(margin, margin, margin, margin)
+        self.shell.setProperty("maximized", maximized)
+        self.titlebar.setProperty("maximized", maximized)
+        self.size_grip.setVisible(not maximized)
+        self.titlebar.max_btn.setText("❐" if maximized else "□")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
 
     def _build_left_panel(self):
         scroll = QScrollArea()
@@ -582,6 +871,11 @@ class LauncherWindow(QMainWindow):
         options_layout.addWidget(self.clear_db_check)
         layout.addWidget(options_card)
 
+        self.view_testing_tickets_button = QPushButton("View Testing Tickets")
+        self.view_testing_tickets_button.setObjectName("GhostButton")
+        self.view_testing_tickets_button.clicked.connect(self.open_testing_tickets)
+        layout.addWidget(self.view_testing_tickets_button)
+
         actions = QGridLayout()
         actions.setHorizontalSpacing(10)
         actions.setVerticalSpacing(10)
@@ -609,11 +903,18 @@ class LauncherWindow(QMainWindow):
         return scroll
 
     def _build_right_panel(self):
+        scroll = QScrollArea()
+        scroll.setObjectName("RightPanelScroll")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
         panel = QFrame()
         panel.setObjectName("Panel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(12)
@@ -644,10 +945,95 @@ class LauncherWindow(QMainWindow):
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.log_box.setMinimumHeight(130)
+        self.log_box.setMaximumHeight(180)
         font = QFont("Consolas")
         font.setPointSize(10)
         self.log_box.setFont(font)
         layout.addWidget(self.log_box)
+
+        tickets_header = QHBoxLayout()
+        tickets_header.setSpacing(10)
+
+        tickets_title = QLabel("Testing Tickets")
+        tickets_title.setObjectName("SectionTitle")
+
+        self.checkout_ticket_branch_button = QPushButton("Checkout Ticket Branch")
+        self.checkout_ticket_branch_button.setObjectName("SecondaryButton")
+        self.checkout_ticket_branch_button.setEnabled(False)
+        self.checkout_ticket_branch_button.clicked.connect(self.checkout_ticket_branch)
+
+        self.checkout_dev_branch_button = QPushButton("Checkout Dev")
+        self.checkout_dev_branch_button.setObjectName("GhostButton")
+        self.checkout_dev_branch_button.clicked.connect(self.checkout_dev_branch)
+
+        self.fetch_branch_changes_button = QPushButton("Fetch Branch Changes")
+        self.fetch_branch_changes_button.setObjectName("GhostButton")
+        self.fetch_branch_changes_button.clicked.connect(
+            self.fetch_current_branch_changes
+        )
+
+        tickets_header.addWidget(tickets_title)
+        tickets_header.addStretch()
+        tickets_header.addWidget(self.fetch_branch_changes_button)
+        tickets_header.addWidget(self.checkout_dev_branch_button)
+        tickets_header.addWidget(self.checkout_ticket_branch_button)
+        layout.addLayout(tickets_header)
+
+        self.ticket_scope_label = QLabel("Projects: not loaded")
+        self.ticket_scope_label.setObjectName("FooterCopy")
+        layout.addWidget(self.ticket_scope_label)
+
+        self.testing_ticket_list = QListWidget()
+        self.testing_ticket_list.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+        self.testing_ticket_list.itemClicked.connect(self.show_testing_ticket_details)
+
+        self.testing_ticket_details = QTextEdit()
+        self.testing_ticket_details.setReadOnly(True)
+        self.testing_ticket_details.setPlaceholderText(
+            "Use 'View Testing Tickets' to load and select a ticket."
+        )
+        self.testing_ticket_details.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+
+        tickets_splitter = QSplitter(Qt.Horizontal)
+        tickets_splitter.addWidget(self.testing_ticket_list)
+        tickets_splitter.addWidget(self.testing_ticket_details)
+        tickets_splitter.setStretchFactor(0, 2)
+        tickets_splitter.setStretchFactor(1, 3)
+        tickets_splitter.setChildrenCollapsible(False)
+        tickets_splitter.setMinimumHeight(250)
+        tickets_splitter.setSizes([280, 520])
+        layout.addWidget(tickets_splitter, 1)
+
+        media_title = QLabel("Images / Videos")
+        media_title.setObjectName("SectionTitle")
+        layout.addWidget(media_title)
+
+        self.ticket_media_list = QListWidget()
+        self.ticket_media_list.setMaximumHeight(150)
+        self.ticket_media_list.itemClicked.connect(self.preview_ticket_media)
+        self.ticket_media_list.itemDoubleClicked.connect(self.open_ticket_media)
+
+        self.image_preview = QLabel(
+            "Select media to preview. Double-click to open in browser."
+        )
+        self.image_preview.setAlignment(Qt.AlignCenter)
+        self.image_preview.setWordWrap(True)
+        self.image_preview.setMinimumHeight(150)
+        self.image_preview.setObjectName("PathCard")
+
+        media_splitter = QSplitter(Qt.Horizontal)
+        media_splitter.addWidget(self.ticket_media_list)
+        media_splitter.addWidget(self.image_preview)
+        media_splitter.setStretchFactor(0, 2)
+        media_splitter.setStretchFactor(1, 3)
+        media_splitter.setChildrenCollapsible(False)
+        media_splitter.setSizes([280, 520])
+        layout.addWidget(media_splitter)
 
         footer = QLabel(
             "Made for local Flutter desktop automation • clean • run • generate • build"
@@ -655,7 +1041,8 @@ class LauncherWindow(QMainWindow):
         footer.setObjectName("FooterCopy")
         layout.addWidget(footer)
 
-        return panel
+        scroll.setWidget(panel)
+        return scroll
 
     def _apply_styles(self):
         self.setStyleSheet(
@@ -671,11 +1058,19 @@ class LauncherWindow(QMainWindow):
                 border: 1px solid {Palette.BORDER};
                 border-radius: 26px;
             }}
+            #Shell[maximized="true"] {{
+                border-radius: 0px;
+                border: none;
+            }}
             #TitleBar {{
                 background: rgba(255,255,255,0.02);
                 border-top-left-radius: 26px;
                 border-top-right-radius: 26px;
                 border-bottom: 1px solid {Palette.BORDER};
+            }}
+            #TitleBar[maximized="true"] {{
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
             }}
             #AccentBadge {{
                 color: {Palette.CYAN};
@@ -711,6 +1106,10 @@ class LauncherWindow(QMainWindow):
                 border-radius: 22px;
             }}
             #LeftPanelScroll {{
+                background: transparent;
+                border: none;
+            }}
+            #RightPanelScroll {{
                 background: transparent;
                 border: none;
             }}
@@ -835,6 +1234,24 @@ class LauncherWindow(QMainWindow):
                 padding: 14px;
                 color: #bafcff;
                 selection-background-color: #20455a;
+            }}
+            QTextEdit {{
+                background: #08101d;
+                border: 1px solid {Palette.BORDER};
+                border-radius: 18px;
+                padding: 12px;
+                color: #d9f6ff;
+                selection-background-color: #20455a;
+            }}
+            QListWidget {{
+                background: #08101d;
+                border: 1px solid {Palette.BORDER};
+                border-radius: 16px;
+                padding: 8px;
+            }}
+            QSplitter::handle {{
+                background: rgba(148, 167, 198, 0.20);
+                border-radius: 2px;
             }}
             #FooterCopy {{
                 color: {Palette.MUTED};
@@ -964,8 +1381,602 @@ class LauncherWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
+    def save_jira_settings(
+        self,
+        jira_url: str,
+        jira_email: str,
+        jira_api_token: str,
+        jira_board_digits: str,
+        show_success_message: bool = True,
+    ) -> bool:
+        if (
+            not jira_url
+            or not jira_email
+            or not jira_api_token
+            or not jira_board_digits
+        ):
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "Please fill in Jira URL, email, API token, and board digits/project key.",
+            )
+            return False
+
+        self.jira_url = jira_url
+        self.jira_email = jira_email
+        self.jira_api_token = jira_api_token
+        self.jira_board_digits = jira_board_digits
+
+        self.settings.setValue("jira_url", self.jira_url)
+        self.settings.setValue("jira_email", self.jira_email)
+        self.settings.setValue("jira_api_token", self.jira_api_token)
+        self.settings.setValue("jira_board_digits", self.jira_board_digits)
+        self.log("Jira settings saved.")
+        if show_success_message:
+            QMessageBox.information(self, APP_TITLE, "Jira settings saved.")
+        return True
+
+    def has_jira_settings(self) -> bool:
+        return all(
+            [
+                self.jira_url.strip(),
+                self.jira_email.strip(),
+                self.jira_api_token.strip(),
+                self.jira_board_digits.strip(),
+            ]
+        )
+
+    def open_jira_settings_dialog(self):
+        dialog = JiraSettingsDialog(
+            jira_url=self.jira_url,
+            jira_email=self.jira_email,
+            jira_api_token=self.jira_api_token,
+            jira_board_digits=self.jira_board_digits,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        jira_url, jira_email, jira_api_token, jira_board_digits = dialog.get_values()
+        self.save_jira_settings(
+            jira_url=jira_url,
+            jira_email=jira_email,
+            jira_api_token=jira_api_token,
+            jira_board_digits=jira_board_digits,
+            show_success_message=True,
+        )
+
+    def open_testing_tickets(self):
+        if not self.has_jira_settings():
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "Open settings in the top-right gear button and save Jira credentials first.",
+            )
+            return
+
+        self.load_testing_tickets()
+
+    def load_testing_tickets(self):
+        self.testing_ticket_list.clear()
+        self.ticket_media_list.clear()
+        self.selected_ticket_key = ""
+        self.checkout_ticket_branch_button.setEnabled(False)
+        self.testing_ticket_details.setPlainText("Loading testing tickets...")
+        self.image_preview.setText(
+            "Select media to preview. Double-click to open in browser."
+        )
+        self.ticket_scope_label.setText(
+            f"Projects: {', '.join(parse_project_keys(self.jira_board_digits)) or 'not set'}"
+        )
+
+        try:
+            client = JiraClient(self.jira_url, self.jira_email, self.jira_api_token)
+            self.testing_tickets = client.get_testing_tickets(self.jira_board_digits)
+
+            if not self.testing_tickets:
+                self.testing_ticket_details.setPlainText(
+                    "No testing tickets found for the current board digits/project key."
+                )
+                self.log("No testing tickets found.")
+                return
+
+            for ticket in self.testing_tickets:
+                key = ticket.get("key", "UNKNOWN")
+                summary = ticket.get("fields", {}).get("summary", "No summary")
+                self.testing_ticket_list.addItem(QListWidgetItem(f"{key} - {summary}"))
+
+            self.testing_ticket_details.setPlainText(
+                f"Loaded {len(self.testing_tickets)} testing ticket(s). Select one to view details."
+            )
+            self.log(f"Loaded {len(self.testing_tickets)} testing tickets from Jira.")
+
+        except ValueError as exc:
+            self.testing_ticket_details.setPlainText(str(exc))
+            self.log(str(exc))
+            QMessageBox.warning(self, APP_TITLE, str(exc))
+        except requests.exceptions.RequestException as exc:
+            self.testing_ticket_details.setPlainText(
+                f"Failed to load Jira tickets:\n{exc}"
+            )
+            self.log(f"Failed to load Jira tickets: {exc}")
+            QMessageBox.critical(
+                self, "Jira Error", f"Failed to load Jira tickets:\n{exc}"
+            )
+
+    def show_testing_ticket_details(self, item):
+        index = self.testing_ticket_list.row(item)
+        if index < 0 or index >= len(self.testing_tickets):
+            return
+
+        ticket = self.testing_tickets[index]
+        self.selected_ticket_key = ticket.get("key", "").strip()
+        self.checkout_ticket_branch_button.setEnabled(bool(self.selected_ticket_key))
+        fields = ticket.get("fields", {})
+
+        assignee = fields.get("assignee")
+        assignee_name = (
+            assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
+        )
+
+        status = fields.get("status", {})
+        status_name = (
+            status.get("name", "N/A") if isinstance(status, dict) else str(status)
+        )
+
+        priority = fields.get("priority")
+        priority_name = (
+            priority.get("name", "N/A") if isinstance(priority, dict) else "N/A"
+        )
+
+        summary = fields.get("summary", "N/A")
+        description = extract_description_text(fields.get("description"))
+        comments = extract_ticket_comments(fields)
+        media = extract_media_attachments(fields)
+        self.current_ticket_media = media
+
+        self.ticket_media_list.clear()
+        self.image_preview.setText(
+            "Select media to preview. Double-click to open in browser."
+        )
+        if not media:
+            self.ticket_media_list.addItem(QListWidgetItem("No images/videos attached"))
+        else:
+            for media_item in media:
+                prefix = "[Image]" if media_item.get("kind") == "image" else "[Video]"
+                item = QListWidgetItem(f"{prefix} {media_item['filename']}")
+                item.setData(Qt.UserRole, media_item)
+                self.ticket_media_list.addItem(item)
+
+        media_lines = []
+        for media_item in media:
+            media_kind = "Image" if media_item.get("kind") == "image" else "Video"
+            media_url = media_item.get("url") or "No URL available"
+            media_lines.append(
+                f"- {media_kind}: {media_item['filename']}\n  {media_url}"
+            )
+        media_text = (
+            "\n\n".join(media_lines) if media_lines else "No images/videos attached"
+        )
+
+        details_text = (
+            f"KEY:\n{ticket.get('key', 'N/A')}\n\n"
+            f"SUMMARY:\n{summary}\n\n"
+            f"STATUS:\n{status_name}\n\n"
+            f"ASSIGNEE:\n{assignee_name}\n\n"
+            f"PRIORITY:\n{priority_name}\n\n"
+            f"DESCRIPTION:\n{description}\n\n"
+            f"COMMENTS:\n{comments}\n\n"
+            f"MEDIA FILES ({len(media)}):\n{media_text}"
+        )
+        self.testing_ticket_details.setPlainText(details_text)
+
+    def _run_git_command(self, args):
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=self.project_dir,
+            capture_output=True,
+            text=True,
+            creationflags=creationflags,
+        )
+        output = (completed.stdout or "") + (completed.stderr or "")
+        return completed.returncode == 0, output.strip()
+
+    def _is_git_repository(self):
+        ok, output = self._run_git_command(["rev-parse", "--is-inside-work-tree"])
+        return ok and output.lower().endswith("true")
+
+    def _find_branch_by_ticket_tag(self, ticket_key: str):
+        matches = self._find_branches_by_ticket_tag(ticket_key)
+        if not matches:
+            return (None, None)
+        scope, branch = matches[0]
+        return (scope, branch)
+
+    def _get_local_branches(self):
+        ok_local, local_output = self._run_git_command(["branch", "--list"])
+        if not ok_local:
+            return []
+
+        branches = []
+        for line in local_output.splitlines():
+            branch = line.strip().lstrip("* ").strip()
+            if branch:
+                branches.append(branch)
+        return branches
+
+    def _get_remote_branches(self):
+        ok_remote, remote_output = self._run_git_command(["branch", "-r", "--list"])
+        if not ok_remote:
+            return []
+
+        branches = []
+        for line in remote_output.splitlines():
+            branch = line.strip()
+            if not branch or "->" in branch:
+                continue
+            branches.append(branch)
+        return branches
+
+    def _find_branches_by_ticket_tag(self, ticket_key: str):
+        key_lower = ticket_key.lower()
+        matches = []
+
+        for branch in self._get_local_branches():
+            if key_lower in branch.lower():
+                matches.append(("local", branch))
+
+        for branch in self._get_remote_branches():
+            if key_lower in branch.lower():
+                matches.append(("remote", branch))
+
+        return matches
+
+    def _collect_ticket_branch_matches(self, ticket_key: str, candidates):
+        matches = []
+        seen = set()
+
+        local_branches = self._get_local_branches()
+        remote_branches = self._get_remote_branches()
+
+        for branch in candidates:
+            if branch in local_branches and ("local", branch) not in seen:
+                seen.add(("local", branch))
+                matches.append(("local", branch))
+
+            remote_name = f"origin/{branch}"
+            if remote_name in remote_branches and ("remote", remote_name) not in seen:
+                seen.add(("remote", remote_name))
+                matches.append(("remote", remote_name))
+
+        ticket_matches = self._find_branches_by_ticket_tag(ticket_key)
+        for scope, branch in ticket_matches:
+            if (scope, branch) not in seen:
+                seen.add((scope, branch))
+                matches.append((scope, branch))
+
+        return matches
+
+    def _choose_branch_match(self, matches, ticket_key: str):
+        if len(matches) == 1:
+            return matches[0]
+
+        options = [f"{scope}: {branch}" for scope, branch in matches]
+        choice, ok = QInputDialog.getItem(
+            self,
+            APP_TITLE,
+            f"Multiple branches found for {ticket_key}. Choose one:",
+            options,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return (None, None)
+
+        selected_index = options.index(choice)
+        return matches[selected_index]
+
+    def _checkout_branch_reference(self, scope: str, branch: str):
+        if scope == "local":
+            ok, output = self._run_git_command(["checkout", branch])
+            return ok, branch, output
+
+        ok, output = self._run_git_command(["checkout", "-t", branch])
+        if ok:
+            local_name = branch.split("/", 1)[1] if "/" in branch else branch
+            return True, local_name, output
+
+        local_name = branch.split("/", 1)[1] if "/" in branch else branch
+        ok, output = self._run_git_command(["checkout", local_name])
+        if ok:
+            return True, local_name, output
+
+        return False, branch, output
+
+    def _resolve_dev_branch_ref(self):
+        local_branches = self._get_local_branches()
+        if "dev" in local_branches:
+            return "dev"
+
+        remote_branches = self._get_remote_branches()
+        if "origin/dev" in remote_branches:
+            return "origin/dev"
+
+        return None
+
+    def _get_current_branch(self):
+        ok, output = self._run_git_command(["rev-parse", "--abbrev-ref", "HEAD"])
+        if not ok:
+            return None
+
+        branch = output.splitlines()[-1].strip() if output else ""
+        if not branch or branch == "HEAD":
+            return None
+        return branch
+
+    def _get_upstream_branch(self, branch_name: str):
+        ok, output = self._run_git_command(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+        )
+        if ok and output:
+            return output.splitlines()[-1].strip()
+
+        fallback = f"origin/{branch_name}"
+        if fallback in self._get_remote_branches():
+            return fallback
+        return None
+
+    def fetch_current_branch_changes(self):
+        if not self._is_git_repository():
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"The selected project folder is not a git repository:\n{self.project_dir}",
+            )
+            return
+
+        current_branch = self._get_current_branch()
+        if not current_branch:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "The current checkout is detached. Switch to a branch before fetching branch changes.",
+            )
+            return
+
+        upstream_branch = self._get_upstream_branch(current_branch)
+        if not upstream_branch:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                f"No upstream branch is configured for {current_branch}.",
+            )
+            return
+
+        remote_name, remote_branch = upstream_branch.split("/", 1)
+        self.log(f"Fetching updates for {current_branch} from {upstream_branch}...")
+
+        ok, output = self._run_git_command(
+            ["fetch", remote_name, remote_branch, "--prune"]
+        )
+        if not ok:
+            self.log(f"Unable to fetch {upstream_branch}. {output}")
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"Could not fetch updates for {upstream_branch}.\n\n{output or 'Unknown git error.'}",
+            )
+            return
+
+        count_ok, count_output = self._run_git_command(
+            ["rev-list", "--count", f"{current_branch}..{upstream_branch}"]
+        )
+        behind_count = (
+            int(count_output.strip())
+            if count_ok and count_output.strip().isdigit()
+            else 0
+        )
+
+        log_ok, log_output = self._run_git_command(
+            [
+                "log",
+                "--oneline",
+                "--decorate",
+                "-n",
+                "10",
+                f"{current_branch}..{upstream_branch}",
+            ]
+        )
+        recent_commits = log_output.strip() if log_ok else ""
+
+        if behind_count == 0:
+            self.log(f"{current_branch} is up to date with {upstream_branch}.")
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                f"Fetched {upstream_branch}.\n\n{current_branch} is already up to date.",
+            )
+            return
+
+        self.log(
+            f"Fetched {upstream_branch}. {current_branch} is behind by {behind_count} commit(s)."
+        )
+        if recent_commits:
+            self.log("Recent remote commits:")
+            self.log(recent_commits)
+
+        summary = (
+            f"Fetched {upstream_branch}.\n\n"
+            f"{current_branch} is behind by {behind_count} commit(s)."
+        )
+        if recent_commits:
+            summary = f"{summary}\n\nRecent remote commits:\n{recent_commits}"
+
+        QMessageBox.information(self, APP_TITLE, summary)
+
+    def _is_branch_merged_into_dev(self, branch_name: str):
+        dev_ref = self._resolve_dev_branch_ref()
+        if not dev_ref:
+            return False
+
+        ok, _ = self._run_git_command(
+            ["merge-base", "--is-ancestor", branch_name, dev_ref]
+        )
+        return ok
+
+    def _prompt_dev_checkout_if_merged(self, branch_name: str):
+        if not self._is_branch_merged_into_dev(branch_name):
+            return
+
+        response = QMessageBox.question(
+            self,
+            APP_TITLE,
+            (
+                f"{branch_name} appears to be merged into dev.\n\n"
+                "Do you want to switch to dev for testing?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if response == QMessageBox.Yes:
+            self.checkout_dev_branch()
+
+    def checkout_dev_branch(self):
+        if not self._is_git_repository():
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"The selected project folder is not a git repository:\n{self.project_dir}",
+            )
+            return
+
+        self.log("Checking out dev branch...")
+        self._run_git_command(["fetch", "--all", "--prune"])
+
+        ok, output = self._run_git_command(["checkout", "dev"])
+        if ok:
+            self.log("Checked out branch: dev")
+            QMessageBox.information(self, APP_TITLE, "Checked out branch:\ndev")
+            return
+
+        ok, output = self._run_git_command(["checkout", "-t", "origin/dev"])
+        if ok:
+            self.log("Checked out branch: dev (tracking origin/dev)")
+            QMessageBox.information(self, APP_TITLE, "Checked out branch:\ndev")
+            return
+
+        self.log(f"Unable to checkout dev branch. {output}")
+        QMessageBox.warning(
+            self,
+            APP_TITLE,
+            "Could not checkout dev branch. Ensure 'dev' or 'origin/dev' exists.",
+        )
+
+    def checkout_ticket_branch(self):
+        if not self.selected_ticket_key:
+            QMessageBox.information(self, APP_TITLE, "Select a testing ticket first.")
+            return
+
+        if not self._is_git_repository():
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"The selected project folder is not a git repository:\n{self.project_dir}",
+            )
+            return
+
+        ticket_key = self.selected_ticket_key
+        candidates = [
+            ticket_key,
+            ticket_key.lower(),
+            f"feature/{ticket_key}",
+            f"feature/{ticket_key.lower()}",
+            f"bugfix/{ticket_key}",
+            f"bugfix/{ticket_key.lower()}",
+        ]
+
+        self.log(f"Checking out branch for ticket {ticket_key}...")
+        self._run_git_command(["fetch", "--all", "--prune"])
+
+        matches = self._collect_ticket_branch_matches(ticket_key, candidates)
+        if matches:
+            scope, matched_branch = self._choose_branch_match(matches, ticket_key)
+            if not scope or not matched_branch:
+                self.log("Branch selection cancelled.")
+                return
+
+            ok, checked_out_branch, output = self._checkout_branch_reference(
+                scope, matched_branch
+            )
+            if ok:
+                self.log(f"Checked out {scope} branch by ticket tag: {matched_branch}")
+                QMessageBox.information(
+                    self,
+                    APP_TITLE,
+                    f"Checked out branch by ticket tag:\n{checked_out_branch}",
+                )
+                self._prompt_dev_checkout_if_merged(checked_out_branch)
+                return
+
+        self.log(f"No existing branch found for ticket {ticket_key}.")
+        QMessageBox.warning(
+            self,
+            APP_TITLE,
+            f"No existing branch found for ticket {ticket_key}.\n\n"
+            "Searched exact names and branches containing the ticket tag.",
+        )
+
+    def preview_ticket_media(self, item):
+        media_item = item.data(Qt.UserRole)
+        if not isinstance(media_item, dict):
+            return
+
+        url = media_item.get("url")
+        mime = media_item.get("mime", "")
+        if not url:
+            self.image_preview.setText("No media URL available.")
+            return
+
+        if media_item.get("kind") == "video" or mime.startswith("video/"):
+            self.image_preview.setText(
+                f"Video selected:\n{media_item.get('filename', 'video')}\n\nDouble-click to open in browser."
+            )
+            return
+
+        if media_item.get("kind") != "image" and not mime.startswith("image/"):
+            self.image_preview.setText("Unsupported media format.")
+            return
+
+        try:
+            client = JiraClient(self.jira_url, self.jira_email, self.jira_api_token)
+            binary = client.fetch_binary(url)
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(binary):
+                self.image_preview.setText("Unable to render image preview.")
+                return
+
+            scaled = pixmap.scaled(
+                self.image_preview.width() - 16,
+                self.image_preview.height() - 16,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.image_preview.setPixmap(scaled)
+        except requests.exceptions.RequestException as exc:
+            self.image_preview.setText(f"Failed to load image preview:\n{exc}")
+
+    def open_ticket_media(self, item):
+        media_item = item.data(Qt.UserRole)
+        if not isinstance(media_item, dict):
+            return
+        url = media_item.get("url")
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
 
 if __name__ == "__main__":
+    set_windows_app_id("com.lucasnewman.flutterdevlauncher")
     app = QApplication(sys.argv)
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
