@@ -262,6 +262,63 @@ class JiraSettingsDialog(QDialog):
         )
 
 
+class BranchSelectorDialog(QDialog):
+    def __init__(self, branches: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Branch")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(400)
+        self.all_branches = branches
+        self.selected_branch = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Search box
+        search_label = QLabel("Search branches:")
+        layout.addWidget(search_label)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Type to filter branches...")
+        self.search_input.textChanged.connect(self._filter_branches)
+        layout.addWidget(self.search_input)
+
+        # Branch list
+        self.branch_list = QListWidget()
+        self.branch_list.itemDoubleClicked.connect(self._on_branch_double_clicked)
+        self._populate_branches()
+        layout.addWidget(self.branch_list)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate_branches(self):
+        self.branch_list.clear()
+        for branch in self.all_branches:
+            self.branch_list.addItem(branch)
+
+    def _filter_branches(self):
+        search_text = self.search_input.text().lower()
+        self.branch_list.clear()
+
+        for branch in self.all_branches:
+            if search_text in branch.lower():
+                self.branch_list.addItem(branch)
+
+    def _on_branch_double_clicked(self):
+        self.accept()
+
+    def get_selected_branch(self):
+        current_item = self.branch_list.currentItem()
+        if current_item:
+            return current_item.text()
+        return None
+
+
 class CommandWorker(QThread):
     log_signal = Signal(str)
     status_signal = Signal(str)
@@ -973,12 +1030,48 @@ class LauncherWindow(QMainWindow):
             self.fetch_current_branch_changes
         )
 
+        self.open_vscode_button = QPushButton("Open VS Code")
+        self.open_vscode_button.setObjectName("GhostButton")
+        self.open_vscode_button.clicked.connect(self.open_vscode)
+        if qta is not None:
+            self.open_vscode_button.setIcon(
+                qta.icon("mdi.code-braces", color=Palette.TEXT)
+            )
+            self.open_vscode_button.setIconSize(QSize(15, 15))
+
+        self.open_github_desktop_button = QPushButton("Open GitHub Desktop")
+        self.open_github_desktop_button.setObjectName("GhostButton")
+        self.open_github_desktop_button.clicked.connect(self.open_github_desktop)
+        if qta is not None:
+            self.open_github_desktop_button.setIcon(
+                qta.icon("fa5s.code-branch", color=Palette.TEXT)
+            )
+            self.open_github_desktop_button.setIconSize(QSize(15, 15))
+
+        self.select_branch_button = QPushButton("Select Branch")
+        self.select_branch_button.setObjectName("GhostButton")
+        self.select_branch_button.clicked.connect(self.select_and_checkout_branch)
+        if qta is not None:
+            self.select_branch_button.setIcon(
+                qta.icon("fa5s.code-branch", color=Palette.TEXT)
+            )
+            self.select_branch_button.setIconSize(QSize(15, 15))
+
         tickets_header.addWidget(tickets_title)
         tickets_header.addStretch()
         tickets_header.addWidget(self.fetch_branch_changes_button)
         tickets_header.addWidget(self.checkout_dev_branch_button)
         tickets_header.addWidget(self.checkout_ticket_branch_button)
         layout.addLayout(tickets_header)
+
+        # Add a second row of buttons for VSCode, GitHub Desktop, and Branch Selector
+        tools_header = QHBoxLayout()
+        tools_header.setSpacing(10)
+        tools_header.addStretch()
+        tools_header.addWidget(self.select_branch_button)
+        tools_header.addWidget(self.open_vscode_button)
+        tools_header.addWidget(self.open_github_desktop_button)
+        layout.addLayout(tools_header)
 
         self.ticket_scope_label = QLabel("Projects: not loaded")
         self.ticket_scope_label.setObjectName("FooterCopy")
@@ -1926,6 +2019,158 @@ class LauncherWindow(QMainWindow):
             f"No existing branch found for ticket {ticket_key}.\n\n"
             "Searched exact names and branches containing the ticket tag.",
         )
+
+    def open_vscode(self):
+        """Open VS Code with the project directory."""
+        if not self.project_dir:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "No project directory selected.",
+            )
+            return
+
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            subprocess.Popen(
+                ["code", str(self.project_dir)],
+                creationflags=creationflags,
+            )
+            self.log(f"Opening VS Code with {self.project_dir}")
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "VS Code is not installed or not found in system PATH. "
+                "Please install VS Code or add it to your PATH.",
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"Failed to open VS Code: {exc}",
+            )
+
+    def open_github_desktop(self):
+        """Open GitHub Desktop with the project directory."""
+        if not self.project_dir:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "No project directory selected.",
+            )
+            return
+
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            # GitHub Desktop uses the github-windows: URL scheme on Windows
+            if os.name == "nt":
+                subprocess.Popen(
+                    ["github", "clone", str(self.project_dir)],
+                    creationflags=creationflags,
+                )
+            else:
+                # On macOS/Linux, use github-mac or other scheme
+                subprocess.Popen(
+                    ["github", str(self.project_dir)],
+                    creationflags=creationflags,
+                )
+            self.log(f"Opening GitHub Desktop with {self.project_dir}")
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "GitHub Desktop is not installed or not found in system PATH. "
+                "Please install GitHub Desktop or add it to your PATH.",
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"Failed to open GitHub Desktop: {exc}",
+            )
+
+    def select_and_checkout_branch(self):
+        """Open branch selector dialog and checkout selected branch."""
+        if not self._is_git_repository():
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"The selected project folder is not a git repository:\n{self.project_dir}",
+            )
+            return
+
+        self.log("Fetching branches...")
+        self._run_git_command(["fetch", "--all", "--prune"])
+
+        # Get all branches (local and remote)
+        local_branches = self._get_local_branches()
+        remote_branches = self._get_remote_branches()
+
+        all_branches = []
+
+        # Add local branches first
+        for branch in local_branches:
+            all_branches.append(f"[local] {branch}")
+
+        # Add remote branches
+        for branch in remote_branches:
+            if not any(
+                local.endswith(branch.split("/", 1)[1] if "/" in branch else branch)
+                for local in local_branches
+            ):
+                all_branches.append(f"[remote] {branch}")
+
+        if not all_branches:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "No branches found in the repository.",
+            )
+            return
+
+        # Show branch selector dialog
+        dialog = BranchSelectorDialog(all_branches, self)
+        if dialog.exec() != QDialog.Accepted:
+            self.log("Branch selection cancelled.")
+            return
+
+        selected = dialog.get_selected_branch()
+        if not selected:
+            return
+
+        self.log(f"Checking out branch: {selected}")
+
+        # Parse the branch name (remove the [local] or [remote] prefix)
+        if selected.startswith("[local] "):
+            branch_name = selected[8:]
+            scope = "local"
+        elif selected.startswith("[remote] "):
+            branch_name = selected[9:]
+            scope = "remote"
+        else:
+            branch_name = selected
+            scope = "local"
+
+        # Checkout the branch
+        ok, checked_out_branch, output = self._checkout_branch_reference(
+            scope, branch_name
+        )
+        if ok:
+            self.log(f"Checked out branch: {checked_out_branch}")
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                f"Checked out branch:\n{checked_out_branch}",
+            )
+            self._prompt_dev_checkout_if_merged(checked_out_branch)
+        else:
+            self.log(f"Failed to checkout branch: {output}")
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"Failed to checkout branch:\n{output}",
+            )
 
     def preview_ticket_media(self, item):
         media_item = item.data(Qt.UserRole)
