@@ -58,7 +58,7 @@ def resource_path(*parts: str) -> Path:
     return base_path.joinpath(*parts)
 
 
-APP_ICON_PATH = resource_path("assets", "logo.png")
+APP_ICON_PATH = resource_path("assets", "logo.svg")
 
 
 def set_windows_app_id(app_id: str):
