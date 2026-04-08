@@ -1057,6 +1057,15 @@ class LauncherWindow(QMainWindow):
             )
             self.select_branch_button.setIconSize(QSize(15, 15))
 
+        self.git_pull_from_dev_button = QPushButton("Pull from Dev")
+        self.git_pull_from_dev_button.setObjectName("GhostButton")
+        self.git_pull_from_dev_button.clicked.connect(self.git_pull_from_dev)
+        if qta is not None:
+            self.git_pull_from_dev_button.setIcon(
+                qta.icon("fa5s.download", color=Palette.TEXT)
+            )
+            self.git_pull_from_dev_button.setIconSize(QSize(15, 15))
+
         tickets_header.addWidget(tickets_title)
         tickets_header.addStretch()
         tickets_header.addWidget(self.fetch_branch_changes_button)
@@ -1064,10 +1073,11 @@ class LauncherWindow(QMainWindow):
         tickets_header.addWidget(self.checkout_ticket_branch_button)
         layout.addLayout(tickets_header)
 
-        # Add a second row of buttons for VSCode, GitHub Desktop, and Branch Selector
+        # Add a second row of buttons for VSCode, GitHub Desktop, Branch Selector, and Pull from Dev
         tools_header = QHBoxLayout()
         tools_header.setSpacing(10)
         tools_header.addStretch()
+        tools_header.addWidget(self.git_pull_from_dev_button)
         tools_header.addWidget(self.select_branch_button)
         tools_header.addWidget(self.open_vscode_button)
         tools_header.addWidget(self.open_github_desktop_button)
@@ -2031,13 +2041,38 @@ class LauncherWindow(QMainWindow):
             return
 
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            subprocess.Popen(
-                ["code", str(self.project_dir)],
-                creationflags=creationflags,
-            )
-            self.log(f"Opening VS Code with {self.project_dir}")
+            if os.name == "nt":
+                # On Windows, 'code' is a .cmd script that requires cmd.exe to run.
+                subprocess.Popen(
+                    ["cmd", "/c", "code", self.project_dir],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                subprocess.Popen(["code", self.project_dir])
+            self.log(f"Opening VS Code: {self.project_dir}")
         except FileNotFoundError:
+            # Fallback: try the common install location
+            vscode_exe = (
+                Path(os.environ.get("LOCALAPPDATA", ""))
+                / "Programs"
+                / "Microsoft VS Code"
+                / "Code.exe"
+            )
+            if vscode_exe.exists():
+                try:
+                    subprocess.Popen(
+                        [str(vscode_exe), self.project_dir],
+                        creationflags=(
+                            subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                        ),
+                    )
+                    self.log(f"Opening VS Code: {self.project_dir}")
+                    return
+                except Exception as exc2:
+                    QMessageBox.warning(
+                        self, APP_TITLE, f"Failed to open VS Code: {exc2}"
+                    )
+                    return
             QMessageBox.warning(
                 self,
                 APP_TITLE,
@@ -2061,33 +2096,84 @@ class LauncherWindow(QMainWindow):
             )
             return
 
-        try:
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            # GitHub Desktop uses the github-windows: URL scheme on Windows
-            if os.name == "nt":
-                subprocess.Popen(
-                    ["github", "clone", str(self.project_dir)],
-                    creationflags=creationflags,
-                )
-            else:
-                # On macOS/Linux, use github-mac or other scheme
-                subprocess.Popen(
-                    ["github", str(self.project_dir)],
-                    creationflags=creationflags,
-                )
-            self.log(f"Opening GitHub Desktop with {self.project_dir}")
-        except FileNotFoundError:
-            QMessageBox.warning(
-                self,
-                APP_TITLE,
-                "GitHub Desktop is not installed or not found in system PATH. "
-                "Please install GitHub Desktop or add it to your PATH.",
+        launched = False
+
+        if os.name == "nt":
+            # GitHub Desktop on Windows lives under %LOCALAPPDATA%\GitHubDesktop\
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            github_desktop_exe = (
+                Path(local_app_data) / "GitHubDesktop" / "GitHubDesktop.exe"
             )
-        except Exception as exc:
+            if github_desktop_exe.exists():
+                try:
+                    subprocess.Popen(
+                        [str(github_desktop_exe), self.project_dir],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    self.log(f"Opening GitHub Desktop: {self.project_dir}")
+                    launched = True
+                except Exception as exc:
+                    self.log(f"⚠ Failed to launch GitHub Desktop exe: {exc}")
+
+        if not launched:
+            # Fallback: open the project folder in Explorer so the user can drag it in
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.project_dir))))
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "GitHub Desktop executable not found.\n\n"
+                "The project folder has been opened in Explorer instead. "
+                "Drag it into GitHub Desktop to open the repository.",
+            )
+
+    def git_pull_from_dev(self):
+        """Pull the latest changes from origin/dev into the current branch."""
+        if not self._is_git_repository():
             QMessageBox.warning(
                 self,
                 APP_TITLE,
-                f"Failed to open GitHub Desktop: {exc}",
+                f"The selected project folder is not a git repository:\n{self.project_dir}",
+            )
+            return
+
+        current_branch = self._get_current_branch()
+        if not current_branch:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "The current checkout is detached. Switch to a branch before pulling.",
+            )
+            return
+
+        self.log("Fetching dev from origin...")
+        ok_fetch, fetch_output = self._run_git_command(
+            ["fetch", "origin", "dev", "--prune"]
+        )
+        if not ok_fetch:
+            self.log(f"Unable to fetch origin/dev. {fetch_output}")
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"Could not fetch origin/dev.\n\n{fetch_output or 'Unknown git error.'}",
+            )
+            return
+
+        self.log(f"Pulling origin/dev into {current_branch}...")
+        ok_pull, pull_output = self._run_git_command(["pull", "origin", "dev"])
+        self.log(pull_output or "(no output)")
+
+        if ok_pull:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                f"Successfully pulled origin/dev into {current_branch}.\n\n"
+                + (pull_output or ""),
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                f"git pull origin dev failed.\n\n{pull_output or 'Unknown git error.'}",
             )
 
     def select_and_checkout_branch(self):
