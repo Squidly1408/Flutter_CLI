@@ -203,8 +203,8 @@ class Palette:
     BORDER = "#24324d"
     TEXT = "#edf3ff"
     MUTED = "#94a7c6"
-    CYAN = "#10cfd5"
-    CYAN_SOFT = "#0aa9af"
+    SAPHI_green = "#6CC282"
+    SAPHI_green_soft = "#248868"
     GREEN = "#24d08a"
     YELLOW = "#f7c948"
     RED = "#ff5d73"
@@ -1176,7 +1176,7 @@ class LauncherWindow(QMainWindow):
                 border-top-right-radius: 0px;
             }}
             #AccentBadge {{
-                color: {Palette.CYAN};
+                color: {Palette.SAPHI_green};
                 font-size: 18px;
                 font-weight: 700;
             }}
@@ -1218,7 +1218,7 @@ class LauncherWindow(QMainWindow):
             }}
             #MiniBadge {{
                 background: rgba(16, 207, 213, 0.12);
-                color: {Palette.CYAN};
+                color: {Palette.SAPHI_green};
                 border: 1px solid rgba(16, 207, 213, 0.28);
                 border-radius: 10px;
                 padding: 7px 10px;
@@ -1268,8 +1268,8 @@ class LauncherWindow(QMainWindow):
                 background: {Palette.PANEL_ALT};
             }}
             QRadioButton::indicator:checked {{
-                background: {Palette.CYAN};
-                border: 1px solid {Palette.CYAN};
+                background: {Palette.SAPHI_green};
+                border: 1px solid {Palette.SAPHI_green};
             }}
             QCheckBox::indicator {{
                 border-radius: 6px;
@@ -1277,8 +1277,8 @@ class LauncherWindow(QMainWindow):
                 background: {Palette.PANEL_ALT};
             }}
             QCheckBox::indicator:checked {{
-                background: {Palette.CYAN};
-                border: 1px solid {Palette.CYAN};
+                background: {Palette.SAPHI_green};
+                border: 1px solid {Palette.SAPHI_green};
             }}
             QPushButton {{
                 min-height: 44px;
@@ -1288,12 +1288,12 @@ class LauncherWindow(QMainWindow):
                 border: 1px solid {Palette.BORDER};
             }}
             #PrimaryButton {{
-                background: {Palette.CYAN};
+                background: {Palette.SAPHI_green};
                 color: #031317;
                 border: none;
             }}
             #PrimaryButton:hover {{
-                background: {Palette.CYAN_SOFT};
+                background: {Palette.SAPHI_green_soft};
                 color: white;
             }}
             #SecondaryButton {{
@@ -1309,7 +1309,7 @@ class LauncherWindow(QMainWindow):
             }}
             #StatusChip {{
                 background: rgba(16, 207, 213, 0.10);
-                color: {Palette.CYAN};
+                color: {Palette.SAPHI_green};
                 border: 1px solid rgba(16, 207, 213, 0.28);
                 border-radius: 12px;
                 padding: 8px 12px;
@@ -1328,7 +1328,7 @@ class LauncherWindow(QMainWindow):
             }}
             QProgressBar::chunk {{
                 border-radius: 6px;
-                background: {Palette.CYAN};
+                background: {Palette.SAPHI_green};
             }}
             QPlainTextEdit {{
                 background: #08101d;
